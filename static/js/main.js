@@ -38,8 +38,8 @@ async function api(path, options = {}) {
     return response.json();
 }
 
-function failureText(error) {
-    if (error && error.status) return `The server refused the move (HTTP ${error.status}).`;
+function failureText(error, action = 'the move') {
+    if (error && error.status) return `The server refused ${action} (HTTP ${error.status}).`;
     return 'The server did not answer. Is Flask running?';
 }
 
@@ -221,8 +221,10 @@ const ease = {
 };
 
 function tween(seconds, update, easing = ease.inOut) {
-    return new Promise((resolve) => {
-        tweens.add({ start: performance.now(), duration: seconds * 1000 * SPEED, update, easing, resolve });
+    return new Promise((resolve, reject) => {
+        tweens.add({
+            start: performance.now(), duration: seconds * 1000 * SPEED, update, easing, resolve, reject,
+        });
     });
 }
 
@@ -231,7 +233,14 @@ const wait = (seconds) => tween(seconds, () => {});
 function runTweens(now) {
     for (const item of tweens) {
         const t = Math.min(1, (now - item.start) / Math.max(item.duration, 1));
-        item.update(item.easing(t), t);
+        try {
+            item.update(item.easing(t), t);
+        } catch (error) {
+            // A failing animation ends its round through the rejection instead of freezing the loop.
+            tweens.delete(item);
+            item.reject(error);
+            continue;
+        }
         if (t >= 1) {
             tweens.delete(item);
             item.resolve();
@@ -335,6 +344,7 @@ async function playRound(choice) {
     } catch (error) {
         console.error(error);
         setStatus('Something went wrong in this round.', 'lose');
+        syncScore();
     } finally {
         if (world) {
             clearActors();
@@ -478,7 +488,7 @@ async function resetScore() {
         setStatus('Score reset: 0 : 0');
     } catch (error) {
         console.error(error);
-        setStatus(failureText(error), 'lose');
+        setStatus(failureText(error, 'the reset'), 'lose');
     } finally {
         setBusy(false);
     }
@@ -545,6 +555,15 @@ if (world) {
     world.board.setScore(Number(userScoreEl.textContent) || 0, Number(computerScoreEl.textContent) || 0);
     resize();
     window.addEventListener('resize', resize);
+    // Moving the window to a screen with another pixel density fires no resize event.
+    const watchPixelRatio = () => {
+        window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
+            .addEventListener('change', () => {
+                resize();
+                watchPixelRatio();
+            }, { once: true });
+    };
+    watchPixelRatio();
     const timer = new THREE.Timer();
     const lookTarget = world.lookAt.clone();
     renderer.setAnimationLoop((timestamp) => {
@@ -588,8 +607,13 @@ if (world) {
     });
 }
 
-// Sync with the server's score (another tab or a restart may have changed it).
-api('/score').then((data) => {
-    showScore(data);
-    if (world) world.board.setScore(data.user_score, data.computer_score);
-}).catch((error) => console.error(error));
+// Sync with the server's score: on load (another tab or a restart may have changed it)
+// and after a round that broke after the server had already counted it.
+function syncScore() {
+    api('/score').then((data) => {
+        showScore(data);
+        if (world) world.board.setScore(data.user_score, data.computer_score);
+    }).catch((error) => console.error(error));
+}
+
+syncScore();

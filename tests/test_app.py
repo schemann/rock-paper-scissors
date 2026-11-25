@@ -1,4 +1,4 @@
-"""Tests for the Rock Paper Scissors backend: rules, score in memory, JSON mirror."""
+"""Tests for the Rock Paper Scissors backend: rules, score per visitor, JSON mirror."""
 import json
 import os
 import shutil
@@ -41,10 +41,15 @@ class ScoreApiTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.client = rps.app.test_client()
 
-    def play(self, user, computer):
+    def play(self, user, computer, client=None):
         """Play one round with a fixed computer move."""
         with mock.patch.object(rps.random, "choice", return_value=computer):
-            return self.client.post("/play", json={"choice": user})
+            return (client or self.client).post("/play", json={"choice": user})
+
+    def visitor(self, client=None):
+        """Return the anonymous visitor id stored in a client's session cookie."""
+        with (client or self.client).session_transaction() as session:
+            return session["visitor"]
 
     def test_starts_at_zero(self):
         """A fresh game shows 0 : 0."""
@@ -63,6 +68,26 @@ class ScoreApiTest(unittest.TestCase):
             (body["user_score"], body["computer_score"], body["draws"], body["rounds"]),
             (1, 1, 1, 3),
         )
+        self.assertEqual(self.client.get("/score").get_json()["rounds"], 3)
+
+    def test_visitors_keep_separate_scores(self):
+        """Two browsers do not see or reset each other's score."""
+        other = rps.app.test_client()
+        self.play("rock", "scissors")
+        self.play("rock", "scissors")
+        self.play("rock", "paper", client=other)
+        self.assertEqual(self.client.get("/score").get_json()["user_score"], 2)
+        self.assertEqual(other.get("/score").get_json()["computer_score"], 1)
+        other.post("/reset")
+        self.assertEqual(self.client.get("/score").get_json()["user_score"], 2)
+        self.assertNotEqual(self.visitor(), self.visitor(other))
+
+    def test_forged_visitor_id_is_replaced(self):
+        """A session value that is not a valid id gets a fresh one."""
+        with self.client.session_transaction() as session:
+            session["visitor"] = "../../etc/passwd"
+        self.play("rock", "scissors")
+        self.assertRegex(self.visitor(), rps.VISITOR_ID)
 
     def test_invalid_choice_is_rejected(self):
         """A wrong choice, a missing body or a non-object body is a 400 and counts nothing."""
@@ -76,7 +101,45 @@ class ScoreApiTest(unittest.TestCase):
         self.play("scissors", "paper")
         body = self.client.post("/reset").get_json()
         self.assertEqual((body["user_score"], body["computer_score"], body["rounds"]), (0, 0, 0))
-        self.assertEqual(rps.Scoreboard(self.path).snapshot()["rounds"], 0)
+        self.assertEqual(rps.Scoreboard(self.path).snapshot(self.visitor())["rounds"], 0)
+
+    def test_score_survives_a_restart(self):
+        """The JSON mirror brings the score back in a new scoreboard."""
+        self.play("paper", "rock")
+        self.play("paper", "scissors")
+        visitor = self.visitor()
+        with open(self.path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["visitors"][visitor], {"user": 1, "computer": 1, "draws": 0})
+        restarted = rps.Scoreboard(self.path).snapshot(visitor)
+        self.assertEqual((restarted["user_score"], restarted["computer_score"]), (1, 1))
+
+    def test_least_recent_visitors_are_dropped(self):
+        """Beyond MAX_VISITORS the visitor seen longest ago is forgotten."""
+        with mock.patch.object(rps.Scoreboard, "MAX_VISITORS", 2):
+            first, second, third = (rps.app.test_client() for _ in range(3))
+            self.play("rock", "scissors", client=first)
+            self.play("rock", "scissors", client=second)
+            self.play("rock", "scissors", client=first)
+            self.play("rock", "scissors", client=third)
+            self.assertEqual(list(self.board.visitors), [self.visitor(first), self.visitor(third)])
+            self.assertEqual(second.get("/score").get_json()["rounds"], 0)
+            self.assertEqual(first.get("/score").get_json()["rounds"], 2)
+
+    def test_damaged_file_starts_at_zero(self):
+        """A broken or hostile score file never crashes the app."""
+        hostile = json.dumps({"visitors": {
+            "short": {"user": 5},
+            "x" * 20: {"user": -3, "draws": True},
+            "y" * 20: [1, 2],
+        }})
+        for content in ("{not json", "[1, 2]", '{"visitors": 7}', hostile):
+            with open(self.path, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            board = rps.Scoreboard(self.path)
+            self.assertNotIn("short", board.visitors)
+            self.assertNotIn("y" * 20, board.visitors)
+            self.assertEqual(board.snapshot("x" * 20)["rounds"], 0)
 
     def test_unwritable_file_keeps_the_game_running(self):
         """A score file in a missing folder is logged, the score stays in memory."""
@@ -95,29 +158,23 @@ class ScoreApiTest(unittest.TestCase):
                 self.play("rock", "scissors")
         folder = os.path.dirname(self.path)
         self.assertEqual(os.listdir(folder), ["score.json"])
-        self.assertEqual(rps.Scoreboard(self.path).snapshot()["user_score"], 1)
+        restarted = rps.Scoreboard(self.path).snapshot(self.visitor())
+        self.assertEqual(restarted["user_score"], 1)
 
-    def test_score_survives_a_restart(self):
-        """The JSON mirror brings the score back in a new scoreboard."""
-        self.play("paper", "rock")
-        self.play("paper", "scissors")
-        with open(self.path, encoding="utf-8") as handle:
-            self.assertEqual(json.load(handle), {"user": 1, "computer": 1, "draws": 0})
-        restarted = rps.Scoreboard(self.path).snapshot()
-        self.assertEqual((restarted["user_score"], restarted["computer_score"]), (1, 1))
+    def test_failed_cleanup_is_not_a_server_error(self):
+        """If even removing the temp file fails, the round still answers 200."""
+        with mock.patch.object(rps.os, "replace", side_effect=OSError("disk full")), \
+                mock.patch.object(rps.os, "unlink", side_effect=OSError("busy")):
+            with self.assertLogs(rps.app.logger, level="WARNING"):
+                response = self.play("rock", "scissors")
+        self.assertEqual(response.status_code, 200)
 
-    def test_damaged_file_starts_at_zero(self):
-        """A broken or hostile score file never crashes the app."""
-        for content in ("{not json", "[1, 2]", '{"user": -3, "computer": "x", "draws": true}'):
-            with open(self.path, "w", encoding="utf-8") as handle:
-                handle.write(content)
-            self.assertEqual(rps.Scoreboard(self.path).snapshot()["rounds"], 0)
-
-    def test_page_renders(self):
-        """The game page loads."""
+    def test_page_and_health(self):
+        """The game page loads with the vendored three.js, the health check answers."""
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"importmap", response.data)
+        self.assertIn(b"vendor/three/three.module.js", response.data)
+        self.assertEqual(self.client.get("/health").get_json(), {"status": "ok"})
 
 
 if __name__ == "__main__":

@@ -1,0 +1,16 @@
+# Deploy: see README, section "Deploy". SECRET_KEY comes from .env next to this file.
+services:
+  web:
+    build: .
+    image: rock-paper-scissors:current
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      RPS_SECURE_COOKIE: "1"
+    ports:
+      - "127.0.0.1:3060:8000"
+    volumes:
+      - score-data:/data
+
+volumes:
+  score-data:
