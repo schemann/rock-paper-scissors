@@ -43,7 +43,11 @@ function failureText(error, action = 'the move') {
     return 'The server did not answer. Is Flask running?';
 }
 
+// Bumped by every score the page shows, so a slower /score answer never overwrites a newer one.
+let scoreVersion = 0;
+
 function showScore(data) {
+    scoreVersion += 1;
     userScoreEl.textContent = data.user_score;
     computerScoreEl.textContent = data.computer_score;
     drawsEl.textContent = data.draws;
@@ -337,7 +341,10 @@ async function playRound(choice) {
     setBusy(true);
     setStatus('Rock...');
     // Settle the request at once so a failure is never an unhandled rejection during the shake.
-    const request = api('/play', { method: 'POST', body: JSON.stringify({ choice }) })
+    const send = () => api('/play', { method: 'POST', body: JSON.stringify({ choice }) });
+    // A 409 means the browser had no session cookie yet; the answer set one, so retry once.
+    const request = send()
+        .catch((error) => (error.status === 409 ? send() : Promise.reject(error)))
         .then((data) => ({ data }), (error) => ({ error }));
     try {
         await runRound(choice, request);
@@ -482,7 +489,8 @@ async function resetScore() {
     if (busy) return;
     setBusy(true);
     try {
-        const data = await api('/reset', { method: 'POST' });
+        const data = await api('/reset', { method: 'POST' })
+            .catch((error) => (error.status === 409 ? api('/reset', { method: 'POST' }) : Promise.reject(error)));
         showScore(data);
         if (world) world.board.reset();
         setStatus('Score reset: 0 : 0');
@@ -567,6 +575,17 @@ if (world) {
     const timer = new THREE.Timer();
     const lookTarget = world.lookAt.clone();
     renderer.setAnimationLoop((timestamp) => {
+        try {
+            frame(timestamp);
+        } catch (error) {
+            // A broken frame must not stop the loop: end the running round and keep drawing.
+            console.error(error);
+            for (const item of tweens) item.reject(error);
+            tweens.clear();
+        }
+    });
+
+    function frame(timestamp) {
         timer.update(timestamp);
         const dt = Math.min(timer.getDelta(), 0.05);
         const now = performance.now();
@@ -604,13 +623,15 @@ if (world) {
             lookTarget.z,
         );
         renderer.render(world.scene, world.camera);
-    });
+    }
 }
 
 // Sync with the server's score: on load (another tab or a restart may have changed it)
 // and after a round that broke after the server had already counted it.
 function syncScore() {
+    const version = scoreVersion;
     api('/score').then((data) => {
+        if (version !== scoreVersion) return;
         showScore(data);
         if (world) world.board.setScore(data.user_score, data.computer_score);
     }).catch((error) => console.error(error));
