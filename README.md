@@ -9,6 +9,9 @@ Masterschool Backend Development exercise: add a score display to the
   last score. A missing or damaged file starts again at 0 : 0.
 - The frontend is a three.js 3D scene: pick rock, paper or scissors on the pedestals
   (or press 1 2 3, R P S), watch the duel against the computer and the LED scoreboard.
+  0 resets the score. three.js 0.187.0 is vendored in `static/vendor/three` (MIT), so the
+  game runs without a CDN; only the Space Grotesk font comes from Google Fonts.
+- `RPS_SCORE_FILE` sets another path for the score file.
 
 ## Run
 

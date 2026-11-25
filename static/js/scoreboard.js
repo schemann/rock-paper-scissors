@@ -104,11 +104,18 @@ export class Scoreboard {
         this.draw(performance.now());
     }
 
-    // Called every frame; only redraws while a blink runs.
+    // Called every frame; redraws only when the blink phase flips.
     update(now) {
-        if (this.flash && now < this.flashUntil + 50) this.draw(now);
-        else if (this.flash) {
+        if (!this.flash) return;
+        if (now >= this.flashUntil) {
             this.flash = null;
+            this.blinkPhase = null;
+            this.draw(now);
+            return;
+        }
+        const phase = Math.floor((this.flashUntil - now) / 140);
+        if (phase !== this.blinkPhase) {
+            this.blinkPhase = phase;
             this.draw(now);
         }
     }

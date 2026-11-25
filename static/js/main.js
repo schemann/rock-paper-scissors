@@ -30,8 +30,17 @@ async function api(path, options = {}) {
         headers: { 'Content-Type': 'application/json' },
         ...options,
     });
-    if (!response.ok) throw new Error(`${path} answered ${response.status}`);
+    if (!response.ok) {
+        const error = new Error(`${path} answered ${response.status}`);
+        error.status = response.status;
+        throw error;
+    }
     return response.json();
+}
+
+function failureText(error) {
+    if (error && error.status) return `The server refused the move (HTTP ${error.status}).`;
+    return 'The server did not answer. Is Flask running?';
 }
 
 function showScore(data) {
@@ -194,7 +203,11 @@ function buildWorld(renderer) {
         picker.push({ choice, model, glow, hit, hover: 0, home: model.position.clone(), dim: 0 });
     });
 
-    return { scene, camera, lookAt, spots, rings, board, picker, key, actors: [], particles: [] };
+    // One light for the winner, created up front: adding lights later recompiles every shader.
+    const winnerLight = new THREE.PointLight('#ffffff', 0, 6);
+    scene.add(winnerLight);
+
+    return { scene, camera, lookAt, spots, rings, board, picker, key, winnerLight, actors: [], particles: [] };
 }
 
 // ---------- animation helpers ----------
@@ -228,9 +241,15 @@ function runTweens(now) {
 
 let shake = 0;
 
+const burstGeometry = new THREE.TetrahedronGeometry(0.06);
+const burstMaterials = new Map();
+
 function burst(position, color, count = 70) {
-    const geometry = new THREE.TetrahedronGeometry(0.06);
-    const material = new THREE.MeshBasicMaterial({ color, toneMapped: false });
+    const geometry = burstGeometry;
+    if (!burstMaterials.has(color)) {
+        burstMaterials.set(color, new THREE.MeshBasicMaterial({ color, toneMapped: false }));
+    }
+    const material = burstMaterials.get(color);
     for (let i = 0; i < count; i += 1) {
         const mesh = new THREE.Mesh(geometry, material);
         mesh.position.copy(position);
@@ -275,9 +294,26 @@ function spawn(object, position, scale = 1) {
     return object;
 }
 
+// Every round builds fresh models; free their GPU buffers and textures when they leave.
+function disposeObject(object) {
+    object.traverse((child) => {
+        if (child.geometry) child.geometry.dispose();
+        const materials = Array.isArray(child.material) ? child.material : [child.material];
+        for (const material of materials) {
+            if (!material) continue;
+            if (material.map) material.map.dispose();
+            material.dispose();
+        }
+    });
+}
+
 function clearActors() {
-    for (const actor of world.actors) world.scene.remove(actor);
+    for (const actor of world.actors) {
+        world.scene.remove(actor);
+        disposeObject(actor);
+    }
     world.actors = [];
+    world.winnerLight.intensity = 0;
 }
 
 // Turn a model a little toward the centre of the arena.
@@ -291,8 +327,24 @@ async function playRound(choice) {
     if (busy || !CHOICES.includes(choice)) return;
     setBusy(true);
     setStatus('Rock...');
-    const request = api('/play', { method: 'POST', body: JSON.stringify({ choice }) });
+    // Settle the request at once so a failure is never an unhandled rejection during the shake.
+    const request = api('/play', { method: 'POST', body: JSON.stringify({ choice }) })
+        .then((data) => ({ data }), (error) => ({ error }));
+    try {
+        await runRound(choice, request);
+    } catch (error) {
+        console.error(error);
+        setStatus('Something went wrong in this round.', 'lose');
+    } finally {
+        if (world) {
+            clearActors();
+            for (const p of world.picker) p.dim = 0;
+        }
+        setBusy(false);
+    }
+}
 
+async function runRound(choice, request) {
     if (!world) {
         await finishRound(request, null);
         return;
@@ -329,27 +381,21 @@ async function playRound(choice) {
 }
 
 async function finishRound(request, actors) {
-    let data;
-    try {
-        data = await request;
-    } catch (error) {
+    const { data, error } = await request;
+    if (error) {
         console.error(error);
-        setStatus('The server did not answer. Is Flask running?', 'lose');
+        setStatus(failureText(error), 'lose');
         if (actors) {
             await tween(0.3, (k) => {
                 for (const actor of world.actors) actor.scale.setScalar(Math.max(0.01, 1 - k));
             });
-            clearActors();
-            for (const p of world.picker) p.dim = 0;
         }
-        setBusy(false);
         return;
     }
 
     if (!actors) {
         showScore(data);
         setStatus(describe(data), data.result);
-        setBusy(false);
         return;
     }
 
@@ -366,6 +412,8 @@ async function finishRound(request, actors) {
         computer.scale.setScalar(Math.max(0.01, 1.3 * ease.back(k)));
     }, ease.out);
     world.scene.remove(mystery);
+    world.actors = world.actors.filter((actor) => actor !== mystery);
+    disposeObject(mystery);
 
     // Clash in the middle.
     const userHome = world.spots.user.clone();
@@ -395,15 +443,18 @@ async function finishRound(request, actors) {
         const away = result === 'win' ? 1 : -1;
         const loserStart = loser.position.clone();
         const winnerStart = winner.position.clone();
-        const glow = new THREE.PointLight(RESULT_COLOR[result], 0, 6);
-        winner.add(glow);
+        const loserSpin = loser.rotation.z;
+        const winnerSpin = winner.rotation.y;
+        const glow = world.winnerLight;
+        glow.color.set(RESULT_COLOR[result]);
         await tween(0.75, (k, t) => {
             loser.position.x = loserStart.x + away * k * 3.2;
             loser.position.y = Math.max(0.35, loserStart.y + Math.sin(t * Math.PI) * 1.1 - t * t * 1.4);
-            loser.rotation.z += away * -0.22;
+            loser.rotation.z = loserSpin - away * t * 9;
             loser.scale.setScalar(Math.max(0.01, 1.3 * (1 - k * 0.55)));
             winner.position.y = winnerStart.y + Math.sin(k * Math.PI * 0.5) * 0.45;
-            winner.rotation.y += 0.09;
+            winner.rotation.y = winnerSpin + t * Math.PI * 2;
+            glow.position.copy(winner.position);
             glow.intensity = 14 * k;
             if (winner.userData.setOpen) winner.userData.setOpen(0.5 + 0.5 * Math.sin(t * 22));
         }, ease.out);
@@ -414,9 +465,7 @@ async function finishRound(request, actors) {
         for (const actor of world.actors) actor.scale.setScalar(Math.max(0.01, actor.scale.x * (1 - k * 0.5)));
         for (const p of world.picker) p.dim = 1 - k;
     });
-    clearActors();
     setStatus('Pick your move');
-    setBusy(false);
 }
 
 async function resetScore() {
@@ -429,9 +478,10 @@ async function resetScore() {
         setStatus('Score reset: 0 : 0');
     } catch (error) {
         console.error(error);
-        setStatus('The server did not answer. Is Flask running?', 'lose');
+        setStatus(failureText(error), 'lose');
+    } finally {
+        setBusy(false);
     }
-    setBusy(false);
 }
 
 // ---------- input ----------
@@ -479,6 +529,7 @@ if (world) {
 function resize() {
     const width = window.innerWidth;
     const height = window.innerHeight;
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(width, height, false);
     const aspect = width / height;
     world.camera.aspect = aspect;

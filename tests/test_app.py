@@ -72,10 +72,30 @@ class ScoreApiTest(unittest.TestCase):
         self.assertEqual(self.client.get("/score").get_json()["rounds"], 0)
 
     def test_reset(self):
-        """Reset returns to 0 : 0."""
+        """Reset returns to 0 : 0, also after a restart."""
         self.play("scissors", "paper")
         body = self.client.post("/reset").get_json()
         self.assertEqual((body["user_score"], body["computer_score"], body["rounds"]), (0, 0, 0))
+        self.assertEqual(rps.Scoreboard(self.path).snapshot()["rounds"], 0)
+
+    def test_unwritable_file_keeps_the_game_running(self):
+        """A score file in a missing folder is logged, the score stays in memory."""
+        board = rps.Scoreboard(os.path.join(self.path, "missing", "score.json"))
+        with mock.patch.object(rps, "scoreboard", board):
+            with self.assertLogs(rps.app.logger, level="WARNING"):
+                response = self.play("rock", "scissors")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["user_score"], 1)
+
+    def test_failed_replace_leaves_no_temp_file(self):
+        """When the rename fails, the old file stays and no temp file is left over."""
+        self.play("rock", "scissors")
+        with mock.patch.object(rps.os, "replace", side_effect=OSError("disk full")):
+            with self.assertLogs(rps.app.logger, level="WARNING"):
+                self.play("rock", "scissors")
+        folder = os.path.dirname(self.path)
+        self.assertEqual(os.listdir(folder), ["score.json"])
+        self.assertEqual(rps.Scoreboard(self.path).snapshot()["user_score"], 1)
 
     def test_score_survives_a_restart(self):
         """The JSON mirror brings the score back in a new scoreboard."""

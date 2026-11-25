@@ -50,13 +50,20 @@ class Scoreboard:
         if not self.path:
             return
         folder = os.path.dirname(self.path) or "."
+        temp_path = None
         try:
             handle, temp_path = tempfile.mkstemp(dir=folder, prefix=".score-", suffix=".json")
             with os.fdopen(handle, "w", encoding="utf-8") as temp_file:
                 json.dump(self.counts, temp_file)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
             os.replace(temp_path, self.path)
+            temp_path = None
         except OSError as error:
             app.logger.warning("Could not save the score to %s: %s", self.path, error)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
     def record(self, result):
         """Count one round ('win', 'lose' or 'draw') and return the new score."""
