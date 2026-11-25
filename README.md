@@ -55,6 +55,12 @@ cd /opt/rock-paper-scissors
 printf 'SECRET_KEY=%s\n' "$(openssl rand -hex 32)" > .env && chmod 600 .env
 docker compose up -d --build
 
+# Plesk: site rps.schemann.dev in the schemann-networks.de subscription, Let's Encrypt on.
+# The proxy directives are deploy/plesk-nginx.conf; Plesk's CLI has no option for them,
+# so the file goes to the site's conf folder and the domain config is regenerated:
+install -m 644 deploy/plesk-nginx.conf /var/www/vhosts/system/rps.schemann.dev/conf/vhost_nginx.conf
+plesk sbin httpdmng --reconfigure-domain rps.schemann.dev
+
 # update
 cd /opt/rock-paper-scissors && git pull && docker compose up -d --build
 ```
