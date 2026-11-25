@@ -125,19 +125,6 @@ class ScoreApiTest(ScoreTestBase):
         self.browser().get("/score")
         self.assertEqual(len(self.board.visitors) + len(self.board.probation), 0)
 
-    def test_session_flood_cannot_push_out_players(self):
-        """New sessions only churn probation; a player who played stays."""
-        with mock.patch.object(rps.Scoreboard, "PROBATION_MAX", 2), \
-                mock.patch.object(rps.Scoreboard, "MAX_VISITORS", 2), \
-                mock.patch.object(rps.Scoreboard, "PROMOTE_AFTER", 2):
-            self.play("rock", "scissors")
-            self.play("rock", "scissors")
-            self.assertIn(self.visitor(), self.board.visitors)
-            for _ in range(10):
-                self.play("rock", "paper", client=self.browser())
-            self.assertEqual(len(self.board.probation), 2)
-            self.assertEqual(self.client.get("/score").get_json()["user_score"], 2)
-
     def test_invalid_choice_is_rejected(self):
         """A wrong choice, a missing body or a non-object body is a 400 and counts nothing."""
         for payload in ({"choice": "lizard"}, {}, ["rock"], "rock"):
@@ -145,36 +132,67 @@ class ScoreApiTest(ScoreTestBase):
         self.assertEqual(self.client.post("/play", data="not json").status_code, 400)
         self.assertEqual(self.client.get("/score").get_json()["rounds"], 0)
 
-    def test_least_recent_visitors_are_dropped(self):
-        """Beyond MAX_VISITORS the visitor seen longest ago is forgotten."""
-        with mock.patch.object(rps.Scoreboard, "MAX_VISITORS", 2), \
-                mock.patch.object(rps.Scoreboard, "PROMOTE_AFTER", 1):
-            first, second, third = (self.browser() for _ in range(3))
-            self.play("rock", "scissors", client=first)
-            self.play("rock", "scissors", client=second)
-            self.play("rock", "scissors", client=first)
-            self.play("rock", "scissors", client=third)
-            self.assertEqual(list(self.board.visitors), [self.visitor(first), self.visitor(third)])
-            self.assertEqual(second.get("/score").get_json()["rounds"], 0)
-            self.assertEqual(first.get("/score").get_json()["rounds"], 2)
-
-    def test_viewing_counts_as_seen(self):
-        """Reading the score keeps a visitor from being the next one dropped."""
-        with mock.patch.object(rps.Scoreboard, "MAX_VISITORS", 2), \
-                mock.patch.object(rps.Scoreboard, "PROMOTE_AFTER", 1):
-            first, second, third = (self.browser() for _ in range(3))
-            self.play("rock", "scissors", client=first)
-            self.play("rock", "scissors", client=second)
-            first.get("/score")
-            self.play("rock", "scissors", client=third)
-            self.assertEqual(list(self.board.visitors), [self.visitor(first), self.visitor(third)])
-
     def test_page_and_health(self):
         """The game page loads with the vendored three.js, the health check answers."""
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"vendor/three/three.module.js", response.data)
         self.assertEqual(self.client.get("/health").get_json(), {"status": "ok"})
+    def test_session_flood_cannot_push_out_players(self):
+        """Sessions that play enough rounds to be promoted still cannot remove a player."""
+        with mock.patch.object(rps.Scoreboard, "PROBATION_MAX", 2), \
+                mock.patch.object(rps.Scoreboard, "MAX_VISITORS", 2), \
+                mock.patch.object(rps.Scoreboard, "PROMOTE_AFTER", 2):
+            self.play("rock", "scissors")
+            self.play("rock", "scissors")
+            for _ in range(10):
+                attacker = self.browser()
+                self.play("rock", "paper", client=attacker)
+                self.play("rock", "paper", client=attacker)
+            self.assertIn(self.visitor(), self.board.visitors)
+            self.assertEqual(len(self.board.visitors), 2)
+            self.assertEqual(len(self.board.probation), 2)
+            self.assertEqual(self.client.get("/score").get_json()["user_score"], 2)
+
+    def test_full_store_of_active_players_promotes_nobody(self):
+        """While every protected player is active, a newcomer stays in probation."""
+        with mock.patch.object(rps.Scoreboard, "MAX_VISITORS", 2), \
+                mock.patch.object(rps.Scoreboard, "PROMOTE_AFTER", 1):
+            first, second, third = (self.browser() for _ in range(3))
+            for client in (first, second, third):
+                self.play("rock", "scissors", client=client)
+            self.assertEqual(list(self.board.visitors), [self.visitor(first), self.visitor(second)])
+            self.assertEqual(list(self.board.probation), [self.visitor(third)])
+            self.assertEqual(third.get("/score").get_json()["user_score"], 1)
+
+    def test_idle_protected_player_makes_room(self):
+        """After IDLE_SECONDS without a visit, a protected player can be replaced."""
+        start = 1_800_000_000
+        later = start + rps.Scoreboard.IDLE_SECONDS + 1
+        with mock.patch.object(rps.Scoreboard, "MAX_VISITORS", 2), \
+                mock.patch.object(rps.Scoreboard, "PROMOTE_AFTER", 1), \
+                mock.patch.object(rps.time, "time", return_value=start) as clock:
+            first, second, third = (self.browser() for _ in range(3))
+            self.play("rock", "scissors", client=first)
+            self.play("rock", "scissors", client=second)
+            clock.return_value = later
+            self.play("rock", "scissors", client=third)
+            self.assertEqual(list(self.board.visitors), [self.visitor(second), self.visitor(third)])
+
+    def test_viewing_counts_as_seen(self):
+        """Reading the score keeps a protected player from counting as idle."""
+        start = 1_800_000_000
+        later = start + rps.Scoreboard.IDLE_SECONDS + 1
+        with mock.patch.object(rps.Scoreboard, "MAX_VISITORS", 2), \
+                mock.patch.object(rps.Scoreboard, "PROMOTE_AFTER", 1), \
+                mock.patch.object(rps.time, "time", return_value=start) as clock:
+            first, second, third = (self.browser() for _ in range(3))
+            self.play("rock", "scissors", client=first)
+            self.play("rock", "scissors", client=second)
+            clock.return_value = later
+            first.get("/score")
+            self.play("rock", "scissors", client=third)
+            self.assertEqual(list(self.board.visitors), [self.visitor(first), self.visitor(third)])
 
 
 class PersistenceTest(ScoreTestBase):
@@ -199,7 +217,8 @@ class PersistenceTest(ScoreTestBase):
         self.board.flush()
         with open(self.path, encoding="utf-8") as handle:
             saved = json.load(handle)
-        self.assertEqual(saved["probation"][visitor], {"user": 1, "computer": 1, "draws": 0})
+        self.assertEqual({k: saved["probation"][visitor][k] for k in rps.Scoreboard.FIELDS},
+                         {"user": 1, "computer": 1, "draws": 0})
         restarted = rps.Scoreboard(self.path, autosave=None).snapshot(visitor)
         self.assertEqual((restarted["user_score"], restarted["computer_score"]), (1, 1))
 
@@ -296,6 +315,24 @@ class PersistenceTest(ScoreTestBase):
                 mock.patch.object(rps.os, "unlink", side_effect=OSError("busy")):
             with self.assertLogs(rps.app.logger, level="WARNING"):
                 self.board.flush()
+    def test_old_file_with_only_visitors_loads(self):
+        """A file written before probation existed keeps its players as protected."""
+        visitor = "v" * 22
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump({"visitors": {visitor: {"user": 4, "computer": 1, "draws": 0}}}, handle)
+        board = rps.Scoreboard(self.path, autosave=None)
+        self.assertIn(visitor, board.visitors)
+        self.assertEqual(board.snapshot(visitor)["user_score"], 4)
+
+    def test_id_in_both_segments_loads_once(self):
+        """A hand-edited file with one id in both segments keeps the protected entry."""
+        visitor = "w" * 22
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump({"visitors": {visitor: {"user": 5, "computer": 0, "draws": 0}},
+                       "probation": {visitor: {"user": 1, "computer": 0, "draws": 0}}}, handle)
+        board = rps.Scoreboard(self.path, autosave=None)
+        self.assertNotIn(visitor, board.probation)
+        self.assertEqual(board.snapshot(visitor)["user_score"], 5)
 
 
 class SecretKeyTest(unittest.TestCase):

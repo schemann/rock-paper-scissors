@@ -13,6 +13,7 @@ import re
 import secrets
 import tempfile
 import threading
+import time
 from collections import OrderedDict
 
 from flask import Flask, jsonify, render_template, request, send_from_directory, session
@@ -33,11 +34,14 @@ def valid_count(value):
 class Scoreboard:
     """Win counts per visitor, held in memory and mirrored to a JSON file.
 
-    Memory stays bounded by a segmented LRU: a new visitor starts in `probation`
+    Memory stays bounded by two segments. A new visitor starts in `probation`
     (at most PROBATION_MAX, least recently seen dropped first) and moves to the
     protected `visitors` (at most MAX_VISITORS) after PROMOTE_AFTER rounds. A
-    script that keeps creating sessions only churns the probation zone and never
-    pushes out players who actually play. Changes only mark the board dirty; a
+    protected visitor is only replaced after IDLE_SECONDS without a visit; while
+    the protected segment is full of active visitors nobody is promoted. So a
+    script that keeps creating sessions can never remove a protected player; at
+    worst it fills free protected slots and keeps new players in probation, where
+    its own sessions push them out. Changes only mark the board dirty; a
     background thread writes the file every `autosave` seconds, so a burst of
     requests never waits on the disk.
     """
@@ -46,6 +50,8 @@ class Scoreboard:
     MAX_VISITORS = 20000
     PROBATION_MAX = 2000
     PROMOTE_AFTER = 3
+    IDLE_SECONDS = 30 * 24 * 3600
+    SEEN_RESOLUTION = 3600
 
     def __init__(self, path=None, autosave=2.0):
         self._lock = threading.Lock()
@@ -78,18 +84,25 @@ class Scoreboard:
         self._load_segment(saved.get("probation"), self.probation, self.PROBATION_MAX)
 
     def _load_segment(self, entries, target, limit):
-        """Copy valid saved entries into one segment, keeping its size limit."""
+        """Copy valid saved entries into one segment, keeping its size limit.
+
+        An entry without a valid "seen" time (files before it existed) counts as seen now.
+        """
         if not isinstance(entries, dict):
             return
+        now = int(time.time())
         for visitor, counts in entries.items():
             if not isinstance(visitor, str) or not VISITOR_ID.match(visitor):
                 continue
             if not isinstance(counts, dict) or visitor in self.visitors:
                 continue
-            target[visitor] = {
+            entry = {
                 field: counts.get(field) if valid_count(counts.get(field)) else 0
                 for field in self.FIELDS
             }
+            seen = counts.get("seen")
+            entry["seen"] = seen if valid_count(seen) and seen <= now else now
+            target[visitor] = entry
         while len(target) > limit:
             target.popitem(last=False)
 
@@ -136,41 +149,65 @@ class Scoreboard:
                 except OSError:
                     pass
 
+    def _new_entry(self):
+        """A fresh 0 : 0 entry, seen now."""
+        entry = dict.fromkeys(self.FIELDS, 0)
+        entry["seen"] = int(time.time())
+        return entry
+
     def _find(self, visitor):
-        """Return the visitor's counts from either segment and mark them recently seen."""
+        """Return the visitor's entry from either segment and mark it recently seen."""
         for segment in (self.visitors, self.probation):
-            counts = segment.get(visitor)
-            if counts is not None:
+            entry = segment.get(visitor)
+            if entry is not None:
                 segment.move_to_end(visitor)
-                return counts
+                now = int(time.time())
+                if now - entry["seen"] >= self.SEEN_RESOLUTION:
+                    entry["seen"] = now
+                    self.dirty = True
+                return entry
         return None
 
     def _counts(self, visitor):
-        """Return the visitor's counts; a new visitor starts at 0 : 0 in probation."""
-        counts = self._find(visitor)
-        if counts is None:
-            counts = dict.fromkeys(self.FIELDS, 0)
-            self.probation[visitor] = counts
+        """Return the visitor's entry; a new visitor starts at 0 : 0 in probation."""
+        entry = self._find(visitor)
+        if entry is None:
+            entry = self._new_entry()
+            self.probation[visitor] = entry
             while len(self.probation) > self.PROBATION_MAX:
                 self.probation.popitem(last=False)
-        return counts
+        return entry
 
-    def _promote(self, visitor, counts):
-        """Move a visitor who played PROMOTE_AFTER rounds into the protected segment."""
-        if visitor in self.probation and sum(counts.values()) >= self.PROMOTE_AFTER:
-            del self.probation[visitor]
-            self.visitors[visitor] = counts
-            while len(self.visitors) > self.MAX_VISITORS:
-                self.visitors.popitem(last=False)
+    def _promote(self, visitor, entry):
+        """Move a visitor who played PROMOTE_AFTER rounds into the protected segment.
 
-    @staticmethod
-    def _shape(counts):
-        """Return counts in the shape the frontend reads."""
+        A full protected segment only makes room by dropping a visitor idle for longer
+        than IDLE_SECONDS (segments are kept in seen order, so that is the first one);
+        if everyone there is active, the visitor stays in probation.
+        """
+        if visitor not in self.probation or self.rounds(entry) < self.PROMOTE_AFTER:
+            return
+        if len(self.visitors) >= self.MAX_VISITORS:
+            oldest = next(iter(self.visitors.values()))
+            if int(time.time()) - oldest["seen"] <= self.IDLE_SECONDS:
+                return
+            self.visitors.popitem(last=False)
+        del self.probation[visitor]
+        self.visitors[visitor] = entry
+
+    @classmethod
+    def rounds(cls, entry):
+        """Number of rounds an entry has played."""
+        return sum(entry[field] for field in cls.FIELDS)
+
+    @classmethod
+    def _shape(cls, entry):
+        """Return an entry in the shape the frontend reads."""
         return {
-            "user_score": counts["user"],
-            "computer_score": counts["computer"],
-            "draws": counts["draws"],
-            "rounds": sum(counts.values()),
+            "user_score": entry["user"],
+            "computer_score": entry["computer"],
+            "draws": entry["draws"],
+            "rounds": cls.rounds(entry),
         }
 
     def record(self, visitor, result):
@@ -186,17 +223,17 @@ class Scoreboard:
     def reset(self, visitor):
         """Set a visitor's score back to 0 : 0; an unknown visitor is not stored."""
         with self._lock:
-            counts = self._find(visitor)
-            if counts is not None:
-                counts.update(dict.fromkeys(self.FIELDS, 0))
+            entry = self._find(visitor)
+            if entry is not None:
+                entry.update(dict.fromkeys(self.FIELDS, 0))
                 self.dirty = True
             return self._shape(dict.fromkeys(self.FIELDS, 0))
 
     def snapshot(self, visitor):
         """Return a visitor's score; an unknown visitor sees 0 : 0 and is not stored."""
         with self._lock:
-            counts = self._find(visitor)
-            return self._shape(counts or dict.fromkeys(self.FIELDS, 0))
+            entry = self._find(visitor)
+            return self._shape(entry or dict.fromkeys(self.FIELDS, 0))
 
 
 def load_secret_key(environ):
