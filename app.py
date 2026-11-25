@@ -33,20 +33,26 @@ def valid_count(value):
 class Scoreboard:
     """Win counts per visitor, held in memory and mirrored to a JSON file.
 
-    The least recently seen visitors are dropped beyond MAX_VISITORS, so the
-    memory a public server spends on scores stays bounded. Changes only mark
-    the board dirty; a background thread writes the file every `autosave`
-    seconds, so a burst of requests never waits on the disk.
+    Memory stays bounded by a segmented LRU: a new visitor starts in `probation`
+    (at most PROBATION_MAX, least recently seen dropped first) and moves to the
+    protected `visitors` (at most MAX_VISITORS) after PROMOTE_AFTER rounds. A
+    script that keeps creating sessions only churns the probation zone and never
+    pushes out players who actually play. Changes only mark the board dirty; a
+    background thread writes the file every `autosave` seconds, so a burst of
+    requests never waits on the disk.
     """
 
     FIELDS = ("user", "computer", "draws")
     MAX_VISITORS = 20000
+    PROBATION_MAX = 2000
+    PROMOTE_AFTER = 3
 
     def __init__(self, path=None, autosave=2.0):
         self._lock = threading.Lock()
         self._save_lock = threading.Lock()
         self.path = path
         self.visitors = OrderedDict()
+        self.probation = OrderedDict()
         self.dirty = False
         self._load()
         if path and autosave:
@@ -66,20 +72,26 @@ class Scoreboard:
                 saved = json.load(handle)
         except (OSError, ValueError):
             return
-        visitors = saved.get("visitors") if isinstance(saved, dict) else None
-        if not isinstance(visitors, dict):
+        if not isinstance(saved, dict):
             return
-        for visitor, counts in visitors.items():
+        self._load_segment(saved.get("visitors"), self.visitors, self.MAX_VISITORS)
+        self._load_segment(saved.get("probation"), self.probation, self.PROBATION_MAX)
+
+    def _load_segment(self, entries, target, limit):
+        """Copy valid saved entries into one segment, keeping its size limit."""
+        if not isinstance(entries, dict):
+            return
+        for visitor, counts in entries.items():
             if not isinstance(visitor, str) or not VISITOR_ID.match(visitor):
                 continue
-            if not isinstance(counts, dict):
+            if not isinstance(counts, dict) or visitor in self.visitors:
                 continue
-            self.visitors[visitor] = {
+            target[visitor] = {
                 field: counts.get(field) if valid_count(counts.get(field)) else 0
                 for field in self.FIELDS
             }
-        while len(self.visitors) > self.MAX_VISITORS:
-            self.visitors.popitem(last=False)
+        while len(target) > limit:
+            target.popitem(last=False)
 
     def _autosave(self, interval):
         """Write the file whenever something changed, until the process ends."""
@@ -95,7 +107,7 @@ class Scoreboard:
             with self._lock:
                 if not self.dirty:
                     return
-                payload = json.dumps({"visitors": self.visitors})
+                payload = json.dumps({"visitors": self.visitors, "probation": self.probation})
                 self.dirty = False
             if not self._write(payload):
                 with self._lock:
@@ -124,17 +136,32 @@ class Scoreboard:
                 except OSError:
                     pass
 
+    def _find(self, visitor):
+        """Return the visitor's counts from either segment and mark them recently seen."""
+        for segment in (self.visitors, self.probation):
+            counts = segment.get(visitor)
+            if counts is not None:
+                segment.move_to_end(visitor)
+                return counts
+        return None
+
     def _counts(self, visitor):
-        """Return the visitor's counts, created at 0 : 0; marks the visitor as recently seen."""
-        counts = self.visitors.get(visitor)
+        """Return the visitor's counts; a new visitor starts at 0 : 0 in probation."""
+        counts = self._find(visitor)
         if counts is None:
             counts = dict.fromkeys(self.FIELDS, 0)
+            self.probation[visitor] = counts
+            while len(self.probation) > self.PROBATION_MAX:
+                self.probation.popitem(last=False)
+        return counts
+
+    def _promote(self, visitor, counts):
+        """Move a visitor who played PROMOTE_AFTER rounds into the protected segment."""
+        if visitor in self.probation and sum(counts.values()) >= self.PROMOTE_AFTER:
+            del self.probation[visitor]
             self.visitors[visitor] = counts
             while len(self.visitors) > self.MAX_VISITORS:
                 self.visitors.popitem(last=False)
-        else:
-            self.visitors.move_to_end(visitor)
-        return counts
 
     @staticmethod
     def _shape(counts):
@@ -152,26 +179,24 @@ class Scoreboard:
         with self._lock:
             counts = self._counts(visitor)
             counts[field] += 1
+            self._promote(visitor, counts)
             self.dirty = True
             return self._shape(counts)
 
     def reset(self, visitor):
         """Set a visitor's score back to 0 : 0; an unknown visitor is not stored."""
         with self._lock:
-            if visitor in self.visitors:
-                self.visitors[visitor] = dict.fromkeys(self.FIELDS, 0)
-                self.visitors.move_to_end(visitor)
+            counts = self._find(visitor)
+            if counts is not None:
+                counts.update(dict.fromkeys(self.FIELDS, 0))
                 self.dirty = True
             return self._shape(dict.fromkeys(self.FIELDS, 0))
 
     def snapshot(self, visitor):
         """Return a visitor's score; an unknown visitor sees 0 : 0 and is not stored."""
         with self._lock:
-            counts = self.visitors.get(visitor)
-            if counts is None:
-                return self._shape(dict.fromkeys(self.FIELDS, 0))
-            self.visitors.move_to_end(visitor)
-            return self._shape(counts)
+            counts = self._find(visitor)
+            return self._shape(counts or dict.fromkeys(self.FIELDS, 0))
 
 
 def load_secret_key(environ):
@@ -185,6 +210,7 @@ def load_secret_key(environ):
         return key
     if environ.get("RPS_SECURE_COOKIE") == "1":
         raise RuntimeError("SECRET_KEY must be set when RPS_SECURE_COOKIE=1")
+    app.logger.warning("SECRET_KEY is not set: players start a new score after every restart")
     return secrets.token_hex(32)
 
 
@@ -194,8 +220,6 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("RPS_SECURE_COOKIE") == "1",
 )
-if not os.environ.get("SECRET_KEY"):
-    app.logger.warning("SECRET_KEY is not set: players start a new score after every restart")
 scoreboard = Scoreboard(SCORE_FILE)
 
 

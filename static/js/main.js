@@ -39,6 +39,7 @@ async function api(path, options = {}) {
 }
 
 function failureText(error, action = 'the move') {
+    if (error && error.status === 429) return 'Too many moves at once. Wait a second and try again.';
     if (error && error.status) return `The server refused ${action} (HTTP ${error.status}).`;
     return 'The server did not answer. Is Flask running?';
 }
@@ -573,13 +574,18 @@ if (world) {
     };
     watchPixelRatio();
     const timer = new THREE.Timer();
+    let lastFrameError = -Infinity;
     const lookTarget = world.lookAt.clone();
     renderer.setAnimationLoop((timestamp) => {
         try {
             frame(timestamp);
         } catch (error) {
             // A broken frame must not stop the loop: end the running round and keep drawing.
-            console.error(error);
+            // Log at most once a second so a persistent fault does not flood the console.
+            if (timestamp - lastFrameError > 1000) {
+                lastFrameError = timestamp;
+                console.error(error);
+            }
             for (const item of tweens) item.reject(error);
             tweens.clear();
         }

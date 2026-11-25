@@ -101,7 +101,7 @@ class ScoreApiTest(ScoreTestBase):
         self.assertEqual(self.play("rock", "scissors").status_code, 409)
         self.assertRegex(self.visitor(), rps.VISITOR_ID)
         self.assertEqual(self.play("rock", "scissors").status_code, 200)
-        self.assertEqual(list(self.board.visitors), [self.visitor()])
+        self.assertEqual(list(self.board.probation), [self.visitor()])
 
     def test_cookieless_writes_store_nothing(self):
         """A client that never sends its cookie back cannot create score entries."""
@@ -110,7 +110,7 @@ class ScoreApiTest(ScoreTestBase):
             self.assertEqual(bare.post("/play", json={"choice": "rock"}).status_code, 409)
             self.assertEqual(bare.post("/reset").status_code, 409)
             self.assertEqual(bare.get("/score").get_json()["rounds"], 0)
-        self.assertEqual(len(self.board.visitors), 0)
+        self.assertEqual(len(self.board.visitors) + len(self.board.probation), 0)
 
     def test_first_play_without_cookie_hands_one_out(self):
         """The 409 answer sets the cookie, so the retry counts."""
@@ -123,7 +123,20 @@ class ScoreApiTest(ScoreTestBase):
         self.client.get("/score")
         self.client.post("/reset")
         self.browser().get("/score")
-        self.assertEqual(len(self.board.visitors), 0)
+        self.assertEqual(len(self.board.visitors) + len(self.board.probation), 0)
+
+    def test_session_flood_cannot_push_out_players(self):
+        """New sessions only churn probation; a player who played stays."""
+        with mock.patch.object(rps.Scoreboard, "PROBATION_MAX", 2), \
+                mock.patch.object(rps.Scoreboard, "MAX_VISITORS", 2), \
+                mock.patch.object(rps.Scoreboard, "PROMOTE_AFTER", 2):
+            self.play("rock", "scissors")
+            self.play("rock", "scissors")
+            self.assertIn(self.visitor(), self.board.visitors)
+            for _ in range(10):
+                self.play("rock", "paper", client=self.browser())
+            self.assertEqual(len(self.board.probation), 2)
+            self.assertEqual(self.client.get("/score").get_json()["user_score"], 2)
 
     def test_invalid_choice_is_rejected(self):
         """A wrong choice, a missing body or a non-object body is a 400 and counts nothing."""
@@ -134,7 +147,8 @@ class ScoreApiTest(ScoreTestBase):
 
     def test_least_recent_visitors_are_dropped(self):
         """Beyond MAX_VISITORS the visitor seen longest ago is forgotten."""
-        with mock.patch.object(rps.Scoreboard, "MAX_VISITORS", 2):
+        with mock.patch.object(rps.Scoreboard, "MAX_VISITORS", 2), \
+                mock.patch.object(rps.Scoreboard, "PROMOTE_AFTER", 1):
             first, second, third = (self.browser() for _ in range(3))
             self.play("rock", "scissors", client=first)
             self.play("rock", "scissors", client=second)
@@ -146,7 +160,8 @@ class ScoreApiTest(ScoreTestBase):
 
     def test_viewing_counts_as_seen(self):
         """Reading the score keeps a visitor from being the next one dropped."""
-        with mock.patch.object(rps.Scoreboard, "MAX_VISITORS", 2):
+        with mock.patch.object(rps.Scoreboard, "MAX_VISITORS", 2), \
+                mock.patch.object(rps.Scoreboard, "PROMOTE_AFTER", 1):
             first, second, third = (self.browser() for _ in range(3))
             self.play("rock", "scissors", client=first)
             self.play("rock", "scissors", client=second)
@@ -184,9 +199,34 @@ class PersistenceTest(ScoreTestBase):
         self.board.flush()
         with open(self.path, encoding="utf-8") as handle:
             saved = json.load(handle)
-        self.assertEqual(saved["visitors"][visitor], {"user": 1, "computer": 1, "draws": 0})
+        self.assertEqual(saved["probation"][visitor], {"user": 1, "computer": 1, "draws": 0})
         restarted = rps.Scoreboard(self.path, autosave=None).snapshot(visitor)
         self.assertEqual((restarted["user_score"], restarted["computer_score"]), (1, 1))
+
+    def test_promoted_players_survive_a_restart(self):
+        """Both segments are saved and loaded."""
+        for _ in range(3):
+            self.play("paper", "rock")
+        self.board.flush()
+        restarted = rps.Scoreboard(self.path, autosave=None)
+        self.assertIn(self.visitor(), restarted.visitors)
+        self.assertEqual(restarted.snapshot(self.visitor())["user_score"], 3)
+
+    def test_round_during_write_is_not_lost(self):
+        """A round counted while the file is being written is saved by the next flush."""
+        self.play("rock", "scissors")
+        original = self.board._write  # pylint: disable=protected-access
+
+        def write_with_round(payload):
+            self.play("rock", "scissors")
+            return original(payload)
+
+        with mock.patch.object(self.board, "_write", side_effect=write_with_round):
+            self.board.flush()
+        self.assertTrue(self.board.dirty)
+        self.board.flush()
+        restarted = rps.Scoreboard(self.path, autosave=None)
+        self.assertEqual(restarted.snapshot(self.visitor())["user_score"], 2)
 
     def test_flush_writes_only_changes(self):
         """An unchanged board does not touch the disk."""
@@ -208,7 +248,7 @@ class PersistenceTest(ScoreTestBase):
                 break
             threading.Event().wait(0.02)
         with open(self.path, encoding="utf-8") as handle:
-            self.assertEqual(json.load(handle)["visitors"][self.visitor()]["user"], 1)
+            self.assertEqual(json.load(handle)["probation"][self.visitor()]["user"], 1)
 
     def test_damaged_file_starts_at_zero(self):
         """A broken or hostile score file never crashes the app."""
@@ -273,8 +313,10 @@ class SecretKeyTest(unittest.TestCase):
                 rps.load_secret_key(environ)
 
     def test_development_gets_a_fresh_key(self):
-        """Locally a missing key is replaced by a random one."""
-        self.assertEqual(len(rps.load_secret_key({})), 64)
+        """Locally a missing or blank key is replaced by a random one, with a warning."""
+        for environ in ({}, {"SECRET_KEY": "   "}):
+            with self.assertLogs(rps.app.logger, level="WARNING"):
+                self.assertEqual(len(rps.load_secret_key(environ)), 64)
 
     def test_cookie_flags(self):
         """The session cookie is HttpOnly and SameSite=Lax."""

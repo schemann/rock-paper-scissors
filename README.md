@@ -36,9 +36,13 @@ Open http://127.0.0.1:5000.
 
 An unknown choice is a `400`. The score routes answer for the calling browser's own score.
 `/play` and `/reset` need the session cookie the page hands out; without it they answer
-`409`, set the cookie and store nothing (the page retries once), so a client that drops
-cookies cannot fill the store. Only a visitor who played gets a slot; at most 20000 are
-kept, the least recently seen go first. `GET /health` answers `{"status": "ok"}`.
+`409`, set the cookie and store nothing (the page retries once). Only a visitor who played
+gets a slot, and memory stays bounded by a segmented LRU: new visitors start in a
+probation zone of 2000 and move to the protected store of 20000 after three rounds; in
+each zone the least recently seen go first. A script that keeps creating sessions only
+churns the probation zone and cannot push out players who actually play; a brand-new
+player can lose a one- or two-round score during such a flood. `GET /health` answers
+`{"status": "ok"}`.
 
 ## Tests and style
 
@@ -74,4 +78,4 @@ gunicorn runs one worker with eight threads on purpose: the score lives in that 
 process's memory. The score file sits in the Docker volume `score-data`. The container is
 read-only, runs as a non-root user without capabilities, with memory, process and log
 limits; `SECRET_KEY` is required there (the app refuses to start without it). nginx limits
-`/play` and `/reset` to 2 requests a second per IP and everything else to 20.
+`/play` and `/reset` to 5 requests a second per IP (burst 20) and everything else to 20.
